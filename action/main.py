@@ -46,6 +46,14 @@ def upload_asset(args, release, assets, name, data, length):
   })
   r.raise_for_status()
 
+def delete_matching_assets(args, assets, predicate):
+  for asset in assets:
+    if not (asset["name"] == f"{predicate.name}.manifest" or re.compile(rf"^{re.escape(predicate.name)}\.\d{{4}}$").match(asset["name"])):
+      continue
+    delete_asset_url = f"https://api.github.com/repos/{args.repository}/releases/assets/{asset['id']}"
+    session.delete(delete_asset_url).raise_for_status()
+
+
 def process_file(args, release, assets, path):
   chunk_names = []
   original_size = path.stat().st_size
@@ -55,6 +63,23 @@ def process_file(args, release, assets, path):
 
   total_size = path.stat().st_size
   big_chunks = math.ceil(total_size / big_chunk_size)
+  if original_size < 2000 * 1024 * 1024 and big_chunks == 1:
+    delete_matching_assets(args, assets, path)
+    sha_hash = hashlib.sha256()
+    with open(path, "rb") as read_file:
+      while True:
+        data = read_file.read(small_chunk_size)
+        if not data:
+          break
+        sha_hash.update(data)
+      read_file.seek(0)
+      upload_asset(args, release, assets, path.name, read_file, original_size)
+    return {
+      "name": path.name,
+      "size": original_size,
+      "hash": sha_hash.hexdigest(),
+      "is_small": True,
+    }
   sha_hash = hashlib.sha256()
 
   total_uploaded = 0
@@ -73,7 +98,7 @@ def process_file(args, release, assets, path):
           yield data
           total_uploaded += len(data)
           logger.info(f"uploaded {pretty_size(total_uploaded)} / {pretty_size(total_size)} of {path.name}")
-      
+
       chunk_names.append(new_name)
       upload_asset(args, release, assets, new_name, chunk_generator(), big_size)
 
@@ -88,7 +113,12 @@ def process_file(args, release, assets, path):
   manifest_name = f"{path.name}.manifest"
 
   upload_asset(args, release, assets, manifest_name, manifest_json, len(manifest_json))
-
+  return {
+    "name": path.name,
+    "size": original_size,
+    "hash": sha_hash.hexdigest(),
+    "is_small": False,
+  }
 #get the release we will use, creating one if needed
 def get_release(args, retry=False):
   url = f"https://api.github.com/repos/{args.repository}/releases"
@@ -144,7 +174,7 @@ def get_assets(release, args):
   return assets_list
 
 #update release body to include links to the cf worker
-def update_release_body(args):
+def update_release_body(args, processed_files):
   tag_start = "<!-- START_BIG_ASSET_LIST_DO_NOT_REMOVE -->"
   tag_end = "<!-- END_BIG_ASSET_LIST_DO_NOT_REMOVE -->"
   table_lines = [
@@ -155,7 +185,7 @@ def update_release_body(args):
   ]
   release = get_release(args)
   assets = get_assets(release, args)
-  
+
   manifests = []
   for asset in assets:
     if not asset["name"].endswith(".manifest"):
@@ -163,16 +193,34 @@ def update_release_body(args):
     r = session.get(asset["url"], headers={
       "Accept": "application/octet-stream"
     })
-    manifests.append(r.json())
-
-  manifests.sort(key=lambda x: x["name"])
-  for manifest in manifests:
+    manifest = r.json()
     worker_url = args.worker_url or "https://gh-releases.ading2210.workers.dev"
     download_url = f"{worker_url}/{args.repository}/releases/download/{get_tag_name(args.tag_name)}/{manifest['name']}"
-    download_link = f"[{manifest['name']}]({download_url})"
-    line = f"| {download_link} | {pretty_size(manifest['size'])} | <sub><sup>`{manifest['hash']}`</sub></sup> |"
+    manifests.append(
+      {
+        "name": manifest["name"],
+        "size": manifest["size"],
+        "hash": manifest["hash"],
+        "download_url": download_url,
+      }
+    )
+  for info in processed_files:
+    if not info["is_small"]:
+      continue
+    download_url = f"https://github.com/{args.repository}/releases/download/{get_tag_name(args.tag_name)}/{info['name']}"
+    manifests.append(
+      {
+        "name": info["name"],
+        "size": info["size"],
+        "hash": info["hash"],
+        "download_url": download_url,
+      }
+    )
+  manifests.sort(key=lambda x: x["name"])
+  for entry in manifests:
+    download_link = f"[{entry['name']}]({entry['download_url']})"
+    line = f"| {download_link} | {pretty_size(entry['size'])} | <sub><sup>`{entry['hash']}`</sub></sup> |"
     table_lines.append(line)
-    
   table_lines.append("> [!IMPORTANT]")
   table_lines.append("> Download files from the links in the table above, instead of the assets list.")
 
@@ -229,14 +277,19 @@ if __name__ == "__main__":
   assets = get_assets(release, args)
 
   base_path = pathlib.Path(args.workspace).resolve()
+  processed_files = []
   for file_glob in args.files.split("\n"):
     for file_path in base_path.glob(file_glob.strip()):
       try:
-        process_file(args, release, assets,file_path)
-      except Exception as e:
+        result = process_file(args, release, assets,file_path)
+        if result:
+          processed_files.append(result)
+      except Exception:
         logger.error("caught error:")
         logger.error(traceback.format_exc())
         logger.error("retrying file upload")
-        process_file(args, release, assets,file_path)
+        result = process_file(args, release, assets, file_path)
+        if result:
+          processed_files.append(result)
 
-  update_release_body(args)
+  update_release_body(args, processed_files)

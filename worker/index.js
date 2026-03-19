@@ -5,7 +5,7 @@ function get_tag_name(tag_name) {
 }
 
 function hex_to_b64(hex) {
-  return btoa(hex.match(/\w{2}/g).map(function(a) {
+  return btoa(hex.match(/\w{2}/g).map(function (a) {
     return String.fromCharCode(parseInt(a, 16));
   }).join(""));
 }
@@ -15,17 +15,17 @@ async function concat_files(writable, urls) {
   let chunk_url, options;
   while ([chunk_url, options] = chunk_urls.shift()) {
     let chunk_response = await fetch(chunk_url, options);
-    await chunk_response.body.pipeTo(writable, {preventClose: chunk_urls.length > 0});
+    await chunk_response.body.pipeTo(writable, { preventClose: chunk_urls.length > 0 });
   }
 }
 
-function github_request_options(env, {accept} = {}) {
+function github_request_options(env, { accept } = {}) {
   return {
     headers: {
       "User-Agent": "cf-workers",
       "Accept": accept || "application/vnd.github+json",
       "Authorization": `Bearer ${env.GITHUB_TOKEN}`,
-      "X-GitHub-Api-Version": "2022-11-28"  
+      "X-GitHub-Api-Version": "2022-11-28"
     }
   }
 }
@@ -41,7 +41,7 @@ async function get_release(repo, tag, env) {
 
   else {
     let releases_response = await fetch(api_releases_url, github_request_options(env));
-    if (!releases_response.ok) 
+    if (!releases_response.ok)
       return null;
     let releases = await releases_response.json();
     for (let release of releases) {
@@ -75,7 +75,7 @@ async function get_assets(repo, tag, env) {
   let next_page = find_next_page(assets_response.headers.get("link"));
   while (next_page) {
     let next_page_response = await fetch(next_page, github_request_options(env));
-    assets_list.push(...next_page_response.json());
+    assets_list.push(...await next_page_response.json());
     next_page = find_next_page(next_page_response.headers.get("link"));
   }
 
@@ -90,24 +90,34 @@ async function fetch_big_chunks(request, repo, tag, file, env) {
   let use_auth = false;
   let assets = null;
 
+  let direct_url = `https://github.com/${repo}/releases/download/${tag}/${file}`;
   let manifest_url = `https://github.com/${repo}/releases/download/${tag}/${file}.manifest`;
   let response = await fetch(manifest_url);
-  
+
   if (!response.ok) {
+    let direct_response = await fetch(direct_url);
+
+    if (direct_response.ok)
+      return Response.redirect(direct_url, 307);
+
     if (!env.GITHUB_TOKEN)
-      return new Response("404 not found - no public asset manifest available", {status: 404});
+      return new Response("404 not found - no public asset or manifest available", { status: 404 });
 
     use_auth = true;
     assets = await get_assets(repo, tag, env);
     let manifest_asset = assets[`${file}.manifest`];
-    if (!manifest_asset) 
-      return new Response("404 not found - no manifest available", {status: 404});
-    
+    if (!manifest_asset) {
+      let direct_asset = assets[file];
+      if (!direct_asset)
+        return new Response("404 not found - no asset or manifest available", { status: 404 });
+      return Response.redirect(direct_asset.browser_download_url || direct_url, 307);
+    }
+
     response = await fetch(manifest_asset.url, github_request_options(env, {
       accept: "application/octet-stream"
     }));
     if (!response.ok)
-      return new Response("404 not found - failed to download manifest", {status: 404});
+      return new Response("404 not found - failed to download manifest", { status: 404 });
   }
 
   let manifest = await response.json();
@@ -120,7 +130,7 @@ async function fetch_big_chunks(request, repo, tag, file, env) {
   }
 
   if (request.method === "HEAD")
-    return new Response(null, {headers});
+    return new Response(null, { headers });
 
   let chunk_paths;
   if (use_auth) {
@@ -133,14 +143,14 @@ async function fetch_big_chunks(request, repo, tag, file, env) {
   else {
     chunk_paths = manifest.chunks.map(chunk => {
       return [`https://github.com/${repo}/releases/download/${tag}/${chunk}`, {}];
-    });  
+    });
   }
 
   let { readable, writable } = new FixedLengthStream(manifest.size);
   let fetch_impl = url => env.WORKER_B.fetch(url);
   concat_files(writable, chunk_paths, fetch_impl);
 
-  return new Response(readable, {headers, status: 200});
+  return new Response(readable, { headers, status: 200 });
 }
 
 export default {
@@ -148,13 +158,13 @@ export default {
     let url = new URL(request.url);
     let path = url.pathname.substring(1);
     if (request.method !== "GET" && request.method !== "HEAD")
-      return new Response("405 method not allowed", {status: 405});
-    if (url.pathname === "/") 
+      return new Response("405 method not allowed", { status: 405 });
+    if (url.pathname === "/")
       return Response.redirect("https://github.com/ading2210/gh-large-releases");
 
     let path_parts = path.split("/");
     if (path_parts.length != 6) {
-      return new Response("404 not found - bad url path", {status: 404});
+      return new Response("404 not found - bad url path", { status: 404 });
     }
 
     //mimick the github download url, like this:
@@ -166,9 +176,9 @@ export default {
     if (env.WHITELIST_REPOS) {
       let whitelist = env.WHITELIST_REPOS.split(",").map(s => s.trim());
       if (!whitelist.includes(repo.trim()))
-        return new Response("404 not found", {status: 404});
+        return new Response("404 not found", { status: 404 });
     }
-    
+
     return fetch_big_chunks(request, repo, tag, file, env);
   }
 };
