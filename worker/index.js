@@ -156,22 +156,22 @@ async function fetch_big_chunks(request, repo, tag, file, env) {
 export default {
   async fetch(request, env) {
     let url = new URL(request.url);
-    let path = url.pathname.substring(1);
     if (request.method !== "GET" && request.method !== "HEAD")
       return new Response("405 method not allowed", { status: 405 });
     if (url.pathname === "/")
       return Response.redirect("https://github.com/ading2210/gh-large-releases");
 
+    let path = url.pathname.substring(1);
     let path_parts = path.split("/");
-    if (path_parts.length != 6) {
+    if (path_parts.length < 6) {
       return new Response("404 not found - bad url path", { status: 404 });
     }
 
     //mimick the github download url, like this:
     //https://github.com/USER_NAME/REPO_NAME/releases/download/TAG_NAME/FILE_NAME
     let repo = path_parts.slice(0, 2).join("/");
-    let tag = path_parts[4];
-    let file = path_parts[5];
+    let tag = path_parts.slice(4, path_parts.length - 1).join("/");
+    let file = path_parts[path_parts.length - 1];
 
     if (env.WHITELIST_REPOS) {
       let whitelist = env.WHITELIST_REPOS.split(",").map(s => s.trim());
